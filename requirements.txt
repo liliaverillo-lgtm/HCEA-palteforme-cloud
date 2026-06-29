@@ -4,3 +4,4 @@ plotly
 entsoe-py
 pyarrow
 s3fs
+boto3

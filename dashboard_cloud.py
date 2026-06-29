@@ -313,12 +313,15 @@ def jours_cache_dict(start: date, end: date) -> dict[date, tuple[str, int]]:
 
 # ── Écriture en batch ─────────────────────────────────────────────
 
-def sauvegarder_batch_en_r2(resultats_par_jour: dict[date, pd.DataFrame]) -> None:
+def sauvegarder_batch_en_r2(
+    resultats_par_jour: dict[date, pd.DataFrame],
+    df_existing: pd.DataFrame | None = None,
+) -> None:
     """Persiste plusieurs jours dans le Parquet R2 en un seul cycle download-merge-upload.
 
-    Appelé APRÈS l'affichage des graphiques (jamais en cours de téléchargement).
-    Protégé par _parquet_lock pour les accès concurrents des threads ENTSO-E.
-    Fusion outer-join pour intégrer les nouvelles colonnes (réacteurs) sans perte.
+    df_existing : Parquet complet déjà en mémoire (évite un 2ème téléchargement R2).
+                  Si None, on télécharge depuis R2 (fallback).
+    Appelé APRÈS l'affichage des graphiques.
     """
     dfs_to_add: list[pd.DataFrame] = []
     meta_updates: dict              = {}
@@ -344,15 +347,16 @@ def sauvegarder_batch_en_r2(resultats_par_jour: dict[date, pd.DataFrame]) -> Non
         return
 
     with _parquet_lock:
-        # 1. Télécharger le Parquet existant depuis R2
-        df_existing = _load_parquet_raw()
+        # 1. Utiliser le df passé en argument (déjà en mémoire) ou télécharger si absent
+        df_base = df_existing if (df_existing is not None and not df_existing.empty) \
+                  else _load_parquet_raw()
 
         # 2. Fusionner en mémoire
         df_new = pd.concat(dfs_to_add, axis=0)
         df_new = df_new[~df_new.index.duplicated(keep="last")]
 
-        if not df_existing.empty:
-            df_combined = pd.concat([df_existing, df_new], axis=0, join="outer")
+        if not df_base.empty:
+            df_combined = pd.concat([df_base, df_new], axis=0, join="outer")
             df_combined = df_combined[~df_combined.index.duplicated(keep="last")]
             df_combined = df_combined.sort_index()
             df_combined = _dedup_columns(df_combined)
@@ -372,19 +376,30 @@ def sauvegarder_batch_en_r2(resultats_par_jour: dict[date, pd.DataFrame]) -> Non
             json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
         )
 
+    _charger_parquet_complet_cached.clear()
     charger_depuis_parquet_cache.clear()
 
 # ── Lecture avec cache Streamlit ──────────────────────────────────
 
 @st.cache_data(show_spinner=False)
+def _charger_parquet_complet_cached() -> pd.DataFrame:
+    """Télécharge le Parquet COMPLET depuis R2 et le met en cache Streamlit.
+
+    Source unique vérité pour les lectures : charger_depuis_parquet_cache filtre
+    depuis ici, et sauvegarder_batch_en_r2 reçoit ce df en argument pour éviter
+    un second téléchargement. Un seul aller-retour R2 par session de chargement.
+    """
+    return _load_parquet_raw()
+
+
+@st.cache_data(show_spinner=False)
 def charger_depuis_parquet_cache(start: date, end: date) -> pd.DataFrame:
-    """Télécharge depuis R2 et filtre les données Parquet pour la période demandée.
+    """Filtre le Parquet complet (déjà en cache) pour la période demandée.
 
     Résultat mis en cache par Streamlit (@st.cache_data).
-    Le cache est invalidé par charger_depuis_parquet_cache.clear()
-    après chaque sauvegarde ou purge R2.
+    Invalidé par .clear() après chaque sauvegarde ou purge R2.
     """
-    df_prod = _load_parquet_raw()
+    df_prod = _charger_parquet_complet_cached()
     if df_prod.empty:
         return pd.DataFrame()
 
@@ -395,8 +410,9 @@ def charger_depuis_parquet_cache(start: date, end: date) -> pd.DataFrame:
 
 # ── Statistiques & purge ──────────────────────────────────────────
 
+@st.cache_data(ttl=60, show_spinner=False)
 def stats_r2() -> dict:
-    """Statistiques rapides sur le cache R2 (lecture JSON directe, sans cache)."""
+    """Statistiques sur le cache R2 — mises en cache 60 s (évite un download JSON à chaque rerun)."""
     meta = _load_jours_meta_raw()
     if not meta:
         return {"n": 0, "min": None, "max": None}
@@ -433,6 +449,7 @@ def purger_periode_r2(start: date, end: date) -> int:
                 df_prod.to_parquet(buf)
                 _r2_upload(R2_PARQUET_KEY, buf.getvalue())
 
+    _charger_parquet_complet_cached.clear()
     charger_depuis_parquet_cache.clear()
     return len(jours)
 
@@ -568,6 +585,7 @@ with st.sidebar:
         if st.button("Purger la période", use_container_width=True):
             n = purger_periode_r2(start_date, end_date)
             st.session_state.last_render = None   # données affichées devenues obsolètes
+            stats_r2.clear()                      # rafraîchit les stats sidebar immédiatement
             st.toast(f"🗑️ {n} jour(s) supprimés du cache R2", icon="✅")
 
     st.markdown("---")
@@ -1021,7 +1039,12 @@ with st.expander("📋 Télécharger les données (taux de charge %)"):
 
 if nouveaux_jours:
     with st.spinner("💾 Sauvegarde vers Cloudflare R2…"):
-        sauvegarder_batch_en_r2(nouveaux_jours)
+        # _charger_parquet_complet_cached() est déjà en mémoire (téléchargé plus haut) :
+        # on le passe en argument pour éviter un 2ème aller-retour R2.
+        sauvegarder_batch_en_r2(
+            nouveaux_jours,
+            df_existing=_charger_parquet_complet_cached(),
+        )
     st.toast(
         f"☁️ Cache R2 mis à jour — {len(nouveaux_jours)} jour(s) enregistrés",
         icon="✅",

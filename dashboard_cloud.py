@@ -4,100 +4,151 @@ Dashboard — Modulation nucléaire par réacteur (France)
 Normalisation par la puissance nominale IAEA PRIS
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CACHE CLOUD (Parquet + JSON sur Cloudflare R2 / S3)
+CACHE CLOUDFLARE R2  (Parquet + JSON)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Les données sont mises en cache sur un espace de stockage Cloud (S3) :
-  nucleaire_production.parquet  — production par réacteur
+Les données sont persistées sur Cloudflare R2 (API S3-compatible) :
+  nucleaire_production.parquet  — production par réacteur (wide format,
+                                  index DatetimeTZ Europe/Paris)
   nucleaire_jours.json          — métadonnées des jours chargés
+                                  {jour_str: {charge_ts, est_complet}}
 
-• Déploiement : Idéal pour Streamlit Cloud (stockage persistant gratuit).
-• Sécurité : Les clés sont lues depuis st.secrets.
+Flux de mise à jour :
+  1. L'app télécharge le Parquet R2 en mémoire (BytesIO) — < 1 s.
+  2. Algorithme deux-pointeurs → identifie les jours manquants.
+  3. Requête ENTSO-E ciblée sur les jours manquants (2-3 s).
+  4. Fusion en mémoire : nouvelles lignes ajoutées au DataFrame.
+  5. Affichage complet des graphiques.
+  6. Upload du Parquet mis à jour vers R2 — < 1 s.
+
+L'enregistrement R2 (étape 6) a lieu APRÈS l'affichage (étape 5).
+Entre deux utilisations le cache survit aux redémarrages Streamlit Cloud.
+
+CONFIGURATION — .streamlit/secrets.toml
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[cloudflare]
+R2_ENDPOINT_URL       = "https://<account-id>.r2.cloudflarestorage.com"
+R2_ACCESS_KEY_ID      = "votre-r2-access-key-id"
+R2_SECRET_ACCESS_KEY  = "votre-r2-secret-access-key"
+R2_BUCKET_NAME        = "nucleaire-dashboard"
+
+REQUIREMENTS (requirements.txt)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+entsoe-py
+pandas
+pyarrow
+plotly
+streamlit
+boto3
+
+ALGORITHME DE RECHERCHE SÉQUENTIELLE DU CACHE (deux pointeurs)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Listes « jours demandés » et « jours disponibles » sont toutes deux triées.
+Un seul pointeur parcourt les disponibles, sans jamais revenir en arrière.
+Pour chercher le j-ème jour, on repart du pointeur laissé par le (j-1)-ème :
+  → pas de re-scan inutile des jours précédents.
+  → complexité O(n + m) au lieu de O(n × m).
+
+OPTIMISATIONS
+━━━━━━━━━━━━━
+[Cache R2]
+ 1.  Client ENTSO-E partagé via @st.cache_resource (1 seul handshake TLS)
+ 2.  Client boto3 R2 partagé via @st.cache_resource
+ 3.  Vérification cache par algorithme deux-pointeurs (O(n+m))
+ 4.  charger_depuis_parquet_cache mis en cache via @st.cache_data
+ 5.  sauvegarder_batch_en_r2 : download → merge → upload en 1 seul bloc R2
+ 6.  _parquet_lock : sécurité thread pour le cycle read-modify-write R2
+ 7.  Enregistrement R2 après affichage (pas de sauvegarde partielle)
+
+[ENTSO-E]
+ A.  Requêtes multi-jours par blocs de 7 (jusqu'à 7× moins de requêtes HTTP)
+ B.  Parallélisme conditionnel sur les blocs (ThreadPool si > 1 bloc)
+ C.  Slider sidebar pour ajuster le parallélisme (2 / 4 / 6 / 8 workers)
+
+[UX]
+ D.  Bouton Rafraîchir grisé pendant le téléchargement (session_state + rerun)
+
+[Plotly / rendu]
+ 8.  Graphique en marche/arrêtés (area empilée, hover unifié)
+ 9.  Résolution adaptive (1h / 2h / 3h selon nb_jours)
+ 10. Sparklines : hovertemplate allégé sans customdata
+ 11. Shapes hline limitées aux 56 premiers sous-graphiques
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import warnings
 warnings.filterwarnings("ignore")
 
+import io
 import json
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, date
 
+import boto3
+from botocore.exceptions import ClientError
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from entsoe import EntsoePandasClient
-import s3fs # Importé pour lire/écrire le JSON sur le cloud
 
 # ══════════════════════════════════════════════════════════════════
 # 0. CONFIGURATION
 # ══════════════════════════════════════════════════════════════════
 
-API_KEY               = "c5cb3857-bc40-4f4c-a4db-088946785b4a"
-COUNTRY               = "FR"
-TZ                    = "Europe/Paris"
-SEUIL_ON_PCT          = 5
-N_COLS_SPARKLINES     = 4
-BLOC_JOURS            = 30      
-MAX_SHAPES            = 56     
+API_KEY           = "c5cb3857-bc40-4f4c-a4db-088946785b4a"
+COUNTRY           = "FR"
+TZ                = "Europe/Paris"
+SEUIL_ON_PCT      = 5
+N_COLS_SPARKLINES = 4
+BLOC_JOURS        = 7    # taille des blocs pour les requêtes ENTSO-E multi-jours
+MAX_SHAPES        = 56   # limite des hlines décoratifs dans les sparklines
 
-# ── Configuration du stockage Cloud (Cloudflare R2 / S3) ───────────
-# Ces valeurs doivent être configurées dans les secrets de Streamlit
-# (.streamlit/secrets.toml en local, ou dans les paramètres sur Streamlit Cloud)
-try:
-    STORAGE_OPTIONS = {
-        "key": st.secrets["cloudflare"]["R2_ACCESS_KEY_ID"],
-        "secret": st.secrets["cloudflare"]["R2_SECRET_ACCESS_KEY"],
-        "client_kwargs": {
-            "endpoint_url": st.secrets["cloudflare"]["R2_ENDPOINT_URL"]
-        }
-    }
-    BUCKET_NAME = st.secrets["cloudflare"]["R2_BUCKET_NAME"]
-except KeyError:
-    st.error("⚠️ Clés Cloudflare introuvables. Vérifiez vos secrets Streamlit.")
-    st.stop()
-
-PARQUET_URI = f"s3://{BUCKET_NAME}/nucleaire_production.parquet"
-JSON_URI    = f"s3://{BUCKET_NAME}/nucleaire_jours.json"
+# ── Clés des objets R2 ────────────────────────────────────────────
+R2_PARQUET_KEY = "nucleaire_production.parquet"
+R2_META_KEY    = "nucleaire_jours.json"
 
 PUISSANCE_NOMINALE_MW = {
-    "BUGEY 2": 910,     "BUGEY 3": 910,     "BUGEY 4": 880,     "BUGEY 5": 880,
-    "BLAYAIS 1": 910,   "BLAYAIS 2": 910,   "BLAYAIS 3": 910,   "BLAYAIS 4": 910,
-    "CHINON 1": 905,    "CHINON 2": 905,    "CHINON 3": 905,    "CHINON 4": 905,
-    "CRUAS 1": 915,     "CRUAS 2": 915,     "CRUAS 3": 915,     "CRUAS 4": 915,
-    "DAMPIERRE 1": 890, "DAMPIERRE 2": 890, "DAMPIERRE 3": 890, "DAMPIERRE 4": 890,
-    "GRAVELINES 1": 910,"GRAVELINES 2": 910,"GRAVELINES 3": 910,
-    "GRAVELINES 4": 910,"GRAVELINES 5": 910,"GRAVELINES 6": 910,
-    "ST LAURENT 1": 915,"ST LAURENT 2": 915,
-    "TRICASTIN 1": 915, "TRICASTIN 2": 915, "TRICASTIN 3": 915, "TRICASTIN 4": 915,
-    "FLAMANVILLE 1": 1310,"FLAMANVILLE 2": 1310,
-    "PALUEL 1": 1330,   "PALUEL 2": 1330,   "PALUEL 3": 1330,   "PALUEL 4": 1330,
-    "ST ALBAN 1": 1335, "ST ALBAN 2": 1335,
-    "BELLEVILLE 1": 1310,"BELLEVILLE 2": 1310,
-    "CATTENOM 1": 1300, "CATTENOM 2": 1300, "CATTENOM 3": 1300, "CATTENOM 4": 1300,
-    "GOLFECH 1": 1310,  "GOLFECH 2": 1310,
-    "NOGENT 1": 1310,   "NOGENT 2": 1310,
-    "PENLY 1": 1320,    "PENLY 2": 1320,
-    "CHOOZ 1": 1500,    "CHOOZ 2": 1500,
-    "CIVAUX 1": 1495,   "CIVAUX 2": 1495,
+    "BUGEY 2": 910,      "BUGEY 3": 910,      "BUGEY 4": 880,      "BUGEY 5": 880,
+    "BLAYAIS 1": 910,    "BLAYAIS 2": 910,    "BLAYAIS 3": 910,    "BLAYAIS 4": 910,
+    "CHINON 1": 905,     "CHINON 2": 905,     "CHINON 3": 905,     "CHINON 4": 905,
+    "CRUAS 1": 915,      "CRUAS 2": 915,      "CRUAS 3": 915,      "CRUAS 4": 915,
+    "DAMPIERRE 1": 890,  "DAMPIERRE 2": 890,  "DAMPIERRE 3": 890,  "DAMPIERRE 4": 890,
+    "GRAVELINES 1": 910, "GRAVELINES 2": 910, "GRAVELINES 3": 910,
+    "GRAVELINES 4": 910, "GRAVELINES 5": 910, "GRAVELINES 6": 910,
+    "ST LAURENT 1": 915, "ST LAURENT 2": 915,
+    "TRICASTIN 1": 915,  "TRICASTIN 2": 915,  "TRICASTIN 3": 915,  "TRICASTIN 4": 915,
+    "FLAMANVILLE 1": 1310, "FLAMANVILLE 2": 1310,
+    "PALUEL 1": 1330,    "PALUEL 2": 1330,    "PALUEL 3": 1330,    "PALUEL 4": 1330,
+    "ST ALBAN 1": 1335,  "ST ALBAN 2": 1335,
+    "BELLEVILLE 1": 1310, "BELLEVILLE 2": 1310,
+    "CATTENOM 1": 1300,  "CATTENOM 2": 1300,  "CATTENOM 3": 1300,  "CATTENOM 4": 1300,
+    "GOLFECH 1": 1310,   "GOLFECH 2": 1310,
+    "NOGENT 1": 1310,    "NOGENT 2": 1310,
+    "PENLY 1": 1320,     "PENLY 2": 1320,
+    "CHOOZ 1": 1500,     "CHOOZ 2": 1500,
+    "CIVAUX 1": 1495,    "CIVAUX 2": 1495,
     "FLAMANVILLE 3": 1630,
 }
 
 AUJOURDHUI    = datetime.now().date()
 HIER          = AUJOURDHUI - timedelta(days=1)
-_parquet_lock = threading.Lock()
+_parquet_lock = threading.Lock()   # protège le cycle download-merge-upload R2
 
 # ══════════════════════════════════════════════════════════════════
 # 1. EXTRACTION ENTSO-E
 # ══════════════════════════════════════════════════════════════════
 
 def _dedup_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Fusionne les colonnes dupliquées en prenant le max (patch ENTSO-E)."""
     if df.columns.duplicated().any():
         df = df.T.groupby(level=0).max().T
     return df
 
+
 def extraire_actual_aggregated(df: pd.DataFrame) -> pd.DataFrame:
+    """MultiIndex ENTSO-E → DataFrame wide (réacteur → MW)."""
     if isinstance(df.columns, pd.MultiIndex):
         niv0 = df.columns.get_level_values(0).astype(str)
         niv1 = df.columns.get_level_values(1).astype(str)
@@ -116,17 +167,76 @@ def extraire_actual_aggregated(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # ══════════════════════════════════════════════════════════════════
-# 2. CACHE CLOUD (R2 / S3)
+# 2. CACHE CLOUDFLARE R2
 # ══════════════════════════════════════════════════════════════════
 
-def _get_fs():
-    """Retourne le système de fichiers S3 connecté."""
-    return s3fs.S3FileSystem(**STORAGE_OPTIONS)
+# ── Client R2 partagé ─────────────────────────────────────────────
+
+@st.cache_resource(show_spinner=False)
+def get_r2_client():
+    """Client boto3 S3 pointant sur Cloudflare R2 (1 seul handshake TLS par session)."""
+    return boto3.client(
+        "s3",
+        endpoint_url=st.secrets["cloudflare"]["R2_ENDPOINT_URL"],
+        aws_access_key_id=st.secrets["cloudflare"]["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=st.secrets["cloudflare"]["R2_SECRET_ACCESS_KEY"],
+        region_name="auto",
+    )
+
+
+def _bucket() -> str:
+    """Nom du bucket R2 (lu depuis st.secrets)."""
+    return st.secrets["cloudflare"]["R2_BUCKET_NAME"]
+
+# ── Primitives R2 ─────────────────────────────────────────────────
+
+def _r2_download(key: str) -> bytes | None:
+    """Télécharge un objet depuis R2. Retourne None si l'objet est absent."""
+    try:
+        resp = get_r2_client().get_object(Bucket=_bucket(), Key=key)
+        return resp["Body"].read()
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ("NoSuchKey", "404", "NoSuchBucket"):
+            return None
+        raise
+
+
+def _r2_upload(key: str, data: bytes) -> None:
+    """Uploade un objet vers R2."""
+    get_r2_client().put_object(Bucket=_bucket(), Key=key, Body=data)
+
+
+def _r2_delete(key: str) -> None:
+    """Supprime un objet de R2 (silencieux si déjà absent)."""
+    try:
+        get_r2_client().delete_object(Bucket=_bucket(), Key=key)
+    except ClientError:
+        pass
+
+
+def _r2_exists(key: str) -> bool:
+    """Vérifie l'existence d'un objet R2 via HEAD (sans télécharger le contenu)."""
+    try:
+        get_r2_client().head_object(Bucket=_bucket(), Key=key)
+        return True
+    except ClientError:
+        return False
+
+# ── Lecture brute (sans cache Streamlit) ──────────────────────────
 
 def _load_parquet_raw() -> pd.DataFrame:
-    """Lit le fichier Parquet depuis le Cloud."""
+    """Télécharge et décode le Parquet depuis R2 (non mis en cache Streamlit).
+
+    Retourne un DataFrame wide avec index DatetimeTZ (Europe/Paris),
+    ou un DataFrame vide si l'objet est absent / illisible.
+    Utilisé en interne pour les cycles lecture-modification-écriture.
+    """
+    data = _r2_download(R2_PARQUET_KEY)
+    if data is None:
+        return pd.DataFrame()
     try:
-        df = pd.read_parquet(PARQUET_URI, storage_options=STORAGE_OPTIONS)
+        df = pd.read_parquet(io.BytesIO(data))
         if df.empty:
             return pd.DataFrame()
         if df.index.tz is None:
@@ -137,20 +247,43 @@ def _load_parquet_raw() -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+
 def _load_jours_meta_raw() -> dict:
-    """Lit le JSON de métadonnées depuis le Cloud."""
-    fs = _get_fs()
+    """Télécharge et décode le JSON de métadonnées depuis R2 (non mis en cache).
+
+    Retourne un dict {jour_str: {"charge_ts": str, "est_complet": int}}.
+    """
+    data = _r2_download(R2_META_KEY)
+    if data is None:
+        return {}
     try:
-        with fs.open(JSON_URI, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(data.decode("utf-8"))
     except Exception:
         return {}
 
+# ── Recherche séquentielle (deux pointeurs) ───────────────────────
+
 def jours_cache_dict(start: date, end: date) -> dict[date, tuple[str, int]]:
-    meta      = _load_jours_meta_raw()
+    """
+    Retourne les jours de [start, end] présents dans le cache R2.
+
+    Algorithme deux-pointeurs — O(n + m) :
+    ┌──────────────────────────────────────────────────────────────┐
+    │  « demandés »   : liste triée des jours de la période       │
+    │  « disponibles »: liste triée des jours en cache JSON       │
+    │                                                              │
+    │  ptr parcourt disponibles une seule fois (jamais en arrière) │
+    │  Pour le j-ème jour demandé, on repart de ptr laissé par    │
+    │  le (j-1)-ème, en avançant jusqu'au premier >= j.           │
+    └──────────────────────────────────────────────────────────────┘
+    Si le JSON ou le Parquet est absent sur R2, renvoie {} (tout à récupérer).
+    """
+    meta = _load_jours_meta_raw()
     if not meta:
         return {}
-        
+    if not _r2_exists(R2_PARQUET_KEY):
+        return {}
+
     available = sorted(date.fromisoformat(j) for j in meta)
     requested = [start + timedelta(days=i) for i in range((end - start).days + 1)]
 
@@ -168,8 +301,15 @@ def jours_cache_dict(start: date, end: date) -> dict[date, tuple[str, int]]:
 
     return result
 
-def sauvegarder_batch_en_parquet(resultats_par_jour: dict[date, pd.DataFrame]) -> None:
-    """Persiste sur le Cloud en remplaçant l'ancien fichier."""
+# ── Écriture en batch ─────────────────────────────────────────────
+
+def sauvegarder_batch_en_r2(resultats_par_jour: dict[date, pd.DataFrame]) -> None:
+    """Persiste plusieurs jours dans le Parquet R2 en un seul cycle download-merge-upload.
+
+    Appelé APRÈS l'affichage des graphiques (jamais en cours de téléchargement).
+    Protégé par _parquet_lock pour les accès concurrents des threads ENTSO-E.
+    Fusion outer-join pour intégrer les nouvelles colonnes (réacteurs) sans perte.
+    """
     dfs_to_add: list[pd.DataFrame] = []
     meta_updates: dict              = {}
     now_iso = datetime.now().isoformat()
@@ -179,7 +319,7 @@ def sauvegarder_batch_en_parquet(resultats_par_jour: dict[date, pd.DataFrame]) -
         if df_wide is None or df_wide.empty:
             continue
         if jour >= today:
-            continue
+            continue  # Ne jamais persister aujourd'hui : données incomplètes
         idx = df_wide.index
         if idx.tz is None:
             idx = idx.tz_localize("UTC")
@@ -194,7 +334,10 @@ def sauvegarder_batch_en_parquet(resultats_par_jour: dict[date, pd.DataFrame]) -
         return
 
     with _parquet_lock:
+        # 1. Télécharger le Parquet existant depuis R2
         df_existing = _load_parquet_raw()
+
+        # 2. Fusionner en mémoire
         df_new = pd.concat(dfs_to_add, axis=0)
         df_new = df_new[~df_new.index.duplicated(keep="last")]
 
@@ -206,20 +349,31 @@ def sauvegarder_batch_en_parquet(resultats_par_jour: dict[date, pd.DataFrame]) -
         else:
             df_combined = df_new.sort_index()
 
-        # Sauvegarde Parquet sur le Cloud
-        df_combined.to_parquet(PARQUET_URI, storage_options=STORAGE_OPTIONS)
+        # 3. Uploader le Parquet mis à jour vers R2
+        buf = io.BytesIO()
+        df_combined.to_parquet(buf)
+        _r2_upload(R2_PARQUET_KEY, buf.getvalue())
 
-        # Mise à jour du JSON sur le Cloud
+        # 4. Mettre à jour et uploader le JSON de métadonnées
         meta = _load_jours_meta_raw()
         meta.update(meta_updates)
-        fs = _get_fs()
-        with fs.open(JSON_URI, "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
+        _r2_upload(
+            R2_META_KEY,
+            json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
 
     charger_depuis_parquet_cache.clear()
 
+# ── Lecture avec cache Streamlit ──────────────────────────────────
+
 @st.cache_data(show_spinner=False)
 def charger_depuis_parquet_cache(start: date, end: date) -> pd.DataFrame:
+    """Télécharge depuis R2 et filtre les données Parquet pour la période demandée.
+
+    Résultat mis en cache par Streamlit (@st.cache_data).
+    Le cache est invalidé par charger_depuis_parquet_cache.clear()
+    après chaque sauvegarde ou purge R2.
+    """
     df_prod = _load_parquet_raw()
     if df_prod.empty:
         return pd.DataFrame()
@@ -229,24 +383,32 @@ def charger_depuis_parquet_cache(start: date, end: date) -> pd.DataFrame:
     mask = (df_prod.index >= borne_start) & (df_prod.index <= borne_end)
     return df_prod.loc[mask].copy()
 
-def stats_parquet() -> dict:
+# ── Statistiques & purge ──────────────────────────────────────────
+
+def stats_r2() -> dict:
+    """Statistiques rapides sur le cache R2 (lecture JSON directe, sans cache)."""
     meta = _load_jours_meta_raw()
     if not meta:
         return {"n": 0, "min": None, "max": None}
     jours = sorted(meta.keys())
     return {"n": len(jours), "min": jours[0], "max": jours[-1]}
 
-def purger_periode_parquet(start: date, end: date) -> int:
+
+def purger_periode_r2(start: date, end: date) -> int:
+    """Supprime les données de la période du cache R2 (Parquet + JSON).
+
+    Retourne le nombre de jours purgés.
+    """
     jours = [start + timedelta(days=i) for i in range((end - start).days + 1)]
 
     with _parquet_lock:
         meta = _load_jours_meta_raw()
         for j in jours:
             meta.pop(str(j), None)
-            
-        fs = _get_fs()
-        with fs.open(JSON_URI, "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
+        _r2_upload(
+            R2_META_KEY,
+            json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
 
         df_prod = _load_parquet_raw()
         if not df_prod.empty:
@@ -254,12 +416,12 @@ def purger_periode_parquet(start: date, end: date) -> int:
             borne_end   = pd.Timestamp(str(end) + " 23:59:59", tz=TZ)
             mask    = (df_prod.index >= borne_start) & (df_prod.index <= borne_end)
             df_prod = df_prod[~mask]
-            
             if df_prod.empty:
-                try: fs.rm(PARQUET_URI)
-                except Exception: pass
+                _r2_delete(R2_PARQUET_KEY)
             else:
-                df_prod.to_parquet(PARQUET_URI, storage_options=STORAGE_OPTIONS)
+                buf = io.BytesIO()
+                df_prod.to_parquet(buf)
+                _r2_upload(R2_PARQUET_KEY, buf.getvalue())
 
     charger_depuis_parquet_cache.clear()
     return len(jours)
@@ -270,13 +432,23 @@ def purger_periode_parquet(start: date, end: date) -> int:
 
 @st.cache_resource(show_spinner=False)
 def get_entsoe_client() -> EntsoePandasClient:
+    """Client ENTSO-E partagé (1 seul handshake TLS par session Streamlit)."""
     return EntsoePandasClient(api_key=API_KEY)
 
+
 def _chunks(lst: list, n: int):
+    """Découpe lst en sous-listes de taille n."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-def api_telecharger_bloc(bloc: list[date], client: EntsoePandasClient) -> dict[date, pd.DataFrame | None]:
+
+def api_telecharger_bloc(
+    bloc: list[date], client: EntsoePandasClient
+) -> dict[date, pd.DataFrame | None]:
+    """Télécharge un bloc de jours en 1 seule requête ENTSO-E.
+
+    Retourne un dict {jour: df_wide | None}.
+    """
     start_ts = pd.Timestamp(str(bloc[0])  + " 00:00", tz=TZ)
     end_ts   = pd.Timestamp(str(bloc[-1]) + " 23:59", tz=TZ)
     try:
@@ -315,6 +487,7 @@ st.caption(
     "Cache : Cloudflare R2 · Données : ENTSO-E"
 )
 
+# ── CSS — sélecteur de plage en rose pâle ─────────────────────────
 st.markdown("""
 <style>
 div[data-baseweb="calendar"] button[aria-selected="true"],
@@ -335,6 +508,16 @@ div[data-baseweb="calendar"] button:disabled {
 </style>
 """, unsafe_allow_html=True)
 
+# ── Session state : gestion du chargement ─────────────────────────
+# is_loading  : True pendant toute la durée du téléchargement + affichage + sauvegarde.
+#               Le bouton Rafraîchir est grisé tant que cette valeur est True.
+# should_load : True dans le rerun où le chargement doit effectivement se produire.
+# auto_loaded : True après le premier chargement automatique (évite une boucle infinie).
+for _k, _v in [("is_loading", False), ("should_load", False), ("auto_loaded", False)]:
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+# ── Sidebar ───────────────────────────────────────────────────────
 with st.sidebar:
     st.header("📅 Période")
 
@@ -345,6 +528,7 @@ with st.sidebar:
         max_value=AUJOURDHUI,
         format="DD/MM/YYYY",
         help="Cliquez d'abord sur la date de début, puis sur la date de fin.",
+        key="date_input_range",
     )
 
     if isinstance(dates, date):
@@ -365,58 +549,110 @@ with st.sidebar:
         "⚡ Parallélisme API",
         options=[2, 4, 6, 8],
         value=4,
-        help="Nombre de blocs téléchargés simultanément depuis ENTSO-E.",
+        help="Nombre de blocs téléchargés simultanément depuis ENTSO-E. "
+             "Valeurs élevées = plus rapide mais risque de throttling.",
     )
 
-    lancer = st.button("🔄 Rafraîchir", type="primary", use_container_width=True)
+    # ── Bouton Rafraîchir — grisé pendant le chargement ──────────
+    # Affiche « ⏳ Chargement… » et disabled=True quand is_loading=True.
+    # Cela est rendu VISIBLE dans le rerun qui suit le clic grâce à st.rerun().
+    if st.session_state.is_loading:
+        st.button(
+            "⏳ Chargement…",
+            type="primary",
+            use_container_width=True,
+            disabled=True,
+        )
+        lancer_clicked = False
+    else:
+        lancer_clicked = st.button(
+            "🔄 Rafraîchir",
+            type="primary",
+            use_container_width=True,
+        )
+
+    # Clic bouton → marquer chargement en cours et redémarrer
+    if lancer_clicked:
+        st.session_state.is_loading = True
+        st.session_state.should_load = True
+        st.rerun()
 
     with st.expander("🗑️ Gestion du cache"):
         st.caption("Force un re-téléchargement de la période sélectionnée.")
-        if st.button("Purger la période", use_container_width=True):
-            n = purger_periode_parquet(start_date, end_date)
-            st.toast(f"🗑️ {n} jour(s) supprimés du cache", icon="✅")
+        if st.button(
+            "Purger la période",
+            use_container_width=True,
+            disabled=st.session_state.is_loading,
+        ):
+            n = purger_periode_r2(start_date, end_date)
+            st.toast(f"🗑️ {n} jour(s) supprimés du cache R2", icon="✅")
 
     st.markdown("---")
-    info = stats_parquet()
+    info = stats_r2()
     if info["n"] == 0:
-        st.caption("📂 Cache Cloud vide — premier lancement.")
+        st.caption("☁️ Cache R2 vide — premier lancement.")
     else:
         st.caption(
-            f"☁️ Cache Cloud : **{info['n']} jours**\n\n"
+            f"☁️ Cache Cloudflare R2 : **{info['n']} jours**\n\n"
             f"Du {info['min']} au {info['max']}"
         )
     st.markdown(
-        "**Source Pnom** : IAEA PRIS"
+        "**Source Pnom** : IAEA PRIS · "
+        "[pris.iaea.org](https://pris.iaea.org/pris/CountryStatistics/"
+        "CountryDetails.aspx?current=FR)"
     )
 
-if "premier_chargement" not in st.session_state:
-    st.session_state.premier_chargement = True
-    lancer = True
+# ── Chargement automatique au premier affichage ───────────────────
+# Déclenche un premier rerun avec is_loading=True pour griser le bouton
+# AVANT que le chargement commence.
+if not st.session_state.auto_loaded and not st.session_state.should_load:
+    st.session_state.auto_loaded  = True
+    st.session_state.is_loading   = True
+    st.session_state.should_load  = True
+    st.rerun()
 
-if not lancer:
+if not st.session_state.should_load:
+    st.info("📅 Sélectionnez une nouvelle période et cliquez sur **Rafraîchir**.")
     st.stop()
 
 if start_date > end_date:
     st.error("La date de début doit être antérieure à la date de fin.")
+    st.session_state.is_loading  = False
+    st.session_state.should_load = False
     st.stop()
 
 # ══════════════════════════════════════════════════════════════════
 # 5. CHARGEMENT
 # ══════════════════════════════════════════════════════════════════
 
-def charger_periode(start: date, end: date) -> tuple[pd.DataFrame, int, int]:
+def charger_periode(
+    start: date, end: date, max_workers: int
+) -> tuple[pd.DataFrame, int, int, dict[date, pd.DataFrame]]:
+    """Télécharge les données manquantes et construit le DataFrame pour l'affichage.
+
+    Retourne (df_combined, nb_cache, nb_api, nouveaux_jours) :
+    - df_combined   : données complètes pour la période (cache R2 + nouvelles)
+    - nb_cache      : jours servis depuis le cache R2
+    - nb_api        : jours téléchargés depuis ENTSO-E
+    - nouveaux_jours: dict {jour: df} à sauvegarder sur R2 APRÈS l'affichage.
+                      Aucune écriture R2 n'a lieu pendant cette fonction.
+    """
     tous_les_jours = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+
+    # Vérification cache — algorithme deux-pointeurs O(n+m)
     jours_info = jours_cache_dict(start, end)
-    now = datetime.now()
+    today = datetime.now().date()
 
     def _est_cache(j: date) -> bool:
-        if j >= now.date(): return False
+        if j >= today:
+            return False
         return jours_info.get(j) is not None
 
     jours_a_fetcher = [j for j in tous_les_jours if not _est_cache(j)]
     nb_cache        = len(tous_les_jours) - len(jours_a_fetcher)
     echecs: list[tuple[str, str]] = []
     nb_ok  = 0
+    nouveaux_jours: dict[date, pd.DataFrame] = {}   # collecte en mémoire, pas de R2 ici
 
     if jours_a_fetcher:
         blocs  = list(_chunks(jours_a_fetcher, BLOC_JOURS))
@@ -429,26 +665,31 @@ def charger_periode(start: date, end: date) -> tuple[pd.DataFrame, int, int]:
         def _fetch_bloc(bloc: list[date]) -> dict[date, pd.DataFrame | None]:
             return api_telecharger_bloc(bloc, client)
 
-        def _process_resultats(resultats: dict[date, pd.DataFrame | None], bloc: list[date]) -> None:
+        def _process_resultats(
+            resultats: dict[date, pd.DataFrame | None], bloc: list[date]
+        ) -> None:
             nonlocal nb_ok
             batch = {j: df for j, df in resultats.items() if df is not None}
             fails = [j for j, df in resultats.items() if df is None]
-            if batch:
-                sauvegarder_batch_en_parquet(batch)
-                nb_ok += len(batch)
+            # Accumuler en mémoire — AUCUNE écriture R2 ici
+            nouveaux_jours.update(batch)
+            nb_ok += len(batch)
             for j in fails:
                 echecs.append((str(j), "Aucune donnée retournée par l'API"))
             with lock:
                 counter["blocs"] += 1
                 pct  = counter["blocs"] / len(blocs)
                 done = counter["blocs"] * BLOC_JOURS
-                barre.progress(pct, text=f"⚡ ~{min(done, len(jours_a_fetcher))}/{len(jours_a_fetcher)} jours traités…")
+                barre.progress(
+                    pct,
+                    text=f"⚡ ~{min(done, len(jours_a_fetcher))}/{len(jours_a_fetcher)} jours traités…",
+                )
 
         if len(blocs) == 1:
             resultats = _fetch_bloc(blocs[0])
             _process_resultats(resultats, blocs[0])
         else:
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS_API) as ex:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
                 futures = {ex.submit(_fetch_bloc, bloc): bloc for bloc in blocs}
                 try:
                     for fut in as_completed(futures, timeout=300):
@@ -463,7 +704,11 @@ def charger_periode(start: date, end: date) -> tuple[pd.DataFrame, int, int]:
                 except Exception:
                     for fut in futures:
                         fut.cancel()
-                    echecs += [(str(j), "Timeout — ENTSO-E n'a pas répondu") for fut in futures if not fut.done() for j in futures[fut]]
+                    echecs += [
+                        (str(j), "Timeout — ENTSO-E n'a pas répondu")
+                        for fut in futures if not fut.done()
+                        for j in futures[fut]
+                    ]
 
         barre.empty()
         if echecs:
@@ -471,26 +716,65 @@ def charger_periode(start: date, end: date) -> tuple[pd.DataFrame, int, int]:
                 for j, err in echecs:
                     st.write(f"**{j}** : {err}")
 
-        charger_depuis_parquet_cache.clear()
+    # ── Construire le DataFrame complet : cache R2 + nouvelles données ──
+    # On fusionne ici EN MÉMOIRE ; aucun upload R2 n'a encore eu lieu.
+    df_cache = charger_depuis_parquet_cache(start, end)
 
-    df     = charger_depuis_parquet_cache(start, end)
-    nb_api = nb_ok
-    return df, nb_cache, nb_api
+    if nouveaux_jours:
+        dfs_new = []
+        for jour, df_j in nouveaux_jours.items():
+            if df_j is None or df_j.empty:
+                continue
+            idx = df_j.index
+            if idx.tz is None:
+                idx = idx.tz_localize("UTC")
+            df_j = df_j.copy()
+            df_j.index   = idx.tz_convert(TZ)
+            df_j.columns = [str(c) for c in df_j.columns]
+            df_j = _dedup_columns(df_j)
+            borne_s = pd.Timestamp(str(jour) + " 00:00", tz=TZ)
+            borne_e = pd.Timestamp(str(jour) + " 23:59:59", tz=TZ)
+            mask = (df_j.index >= borne_s) & (df_j.index <= borne_e)
+            dfs_new.append(df_j.loc[mask])
+
+        if dfs_new:
+            df_new_all = pd.concat(dfs_new, axis=0)
+            df_new_all = df_new_all[~df_new_all.index.duplicated(keep="last")]
+            if not df_cache.empty:
+                df = pd.concat([df_cache, df_new_all], axis=0, join="outer")
+                df = df[~df.index.duplicated(keep="last")]
+                df = df.sort_index()
+                df = _dedup_columns(df)
+            else:
+                df = df_new_all.sort_index()
+        else:
+            df = df_cache
+    else:
+        df = df_cache
+
+    return df, nb_cache, nb_ok, nouveaux_jours
+
 
 with st.spinner("⏳ Chargement des données…"):
     try:
-        df_brut, nb_cache, nb_api = charger_periode(start_date, end_date)
+        df_brut, nb_cache, nb_api, nouveaux_jours = charger_periode(
+            start_date, end_date, MAX_WORKERS_API
+        )
     except Exception as exc:
+        st.session_state.is_loading  = False
+        st.session_state.should_load = False
         st.error(f"Erreur : {exc}")
         st.stop()
 
 if df_brut is None or df_brut.empty:
+    st.session_state.is_loading  = False
+    st.session_state.should_load = False
     st.error("Aucune donnée disponible pour cette période.")
     st.stop()
 
 st.success(
     f"✅ Données chargées — {start_date} → {end_date} · "
-    f"☁️ {nb_cache} jour(s) depuis le cache · "
+    f"☁️ {nb_cache} jour(s) depuis le cache R2 · "
     f"🌐 {nb_api} jour(s) téléchargé(s) depuis l'API"
 )
 
@@ -516,10 +800,17 @@ df_nuc = df_nuc[sorted(df_nuc.columns)]
 
 if df_nuc.empty or df_nuc.shape[1] == 0:
     st.error("Aucune donnée disponible après traitement.")
+    with st.expander("Debug"):
+        st.write(list(df_brut.columns)[:20])
+    st.session_state.is_loading  = False
+    st.session_state.should_load = False
     st.stop()
 
 reacteurs     = df_nuc.columns.tolist()
-serie_pnom    = pd.Series({r: PUISSANCE_NOMINALE_MW.get(r, max(df_nuc[r].max(), 900.0)) for r in reacteurs})
+n_total       = len(reacteurs)
+serie_pnom    = pd.Series(
+    {r: PUISSANCE_NOMINALE_MW.get(r, max(df_nuc[r].max(), 900.0)) for r in reacteurs}
+)
 df_taux       = (df_nuc.div(serie_pnom) * 100).clip(upper=105)
 taux_derniere = df_taux.iloc[-1]
 prod_derniere = df_nuc.iloc[-1]
@@ -528,7 +819,71 @@ reacteurs_off = int((taux_derniere < SEUIL_ON_PCT).sum())
 taux_moyen    = taux_derniere[taux_derniere >= SEUIL_ON_PCT].mean()
 
 # ══════════════════════════════════════════════════════════════════
-# 7. MÉTRIQUES
+# 7. GRAPHIQUE — RÉACTEURS EN MARCHE / ARRÊTÉS
+# ══════════════════════════════════════════════════════════════════
+
+st.subheader("⚙️ Réacteurs en marche et à l'arrêt")
+st.caption(
+    f"🟢 Zone verte = en marche · 🔴 Zone rouge = arrêtés · "
+    f"Parc total : {n_total} réacteurs"
+)
+
+en_marche_ts = (df_taux >= SEUIL_ON_PCT).sum(axis=1)
+arretes_ts   = n_total - en_marche_ts
+
+fig_rcount = go.Figure()
+
+# Zone verte : réacteurs en marche (fill from 0 to en_marche curve)
+fig_rcount.add_trace(go.Scatter(
+    x=en_marche_ts.index,
+    y=en_marche_ts.values,
+    name="En marche",
+    mode="lines",
+    fill="tozeroy",
+    fillcolor="rgba(0,200,83,0.22)",
+    line=dict(color="#00C853", width=2),
+    hovertemplate="<b>✅ En marche</b> : %{y:.0f}<extra></extra>",
+))
+
+# Ligne de référence du parc total (barre en haut) + zone rouge
+# y = n_total (constant) avec fill="tonexty" → remplit entre la courbe verte et ce plafond
+fig_rcount.add_trace(go.Scatter(
+    x=en_marche_ts.index,
+    y=[n_total] * len(en_marche_ts),
+    name="Arrêtés",
+    mode="lines",
+    fill="tonexty",                              # remplit depuis en_marche_ts jusqu'à n_total
+    fillcolor="rgba(229,57,53,0.20)",
+    line=dict(color="rgba(200,200,200,0.5)", width=1.2, dash="dot"),
+    customdata=arretes_ts.values,
+    hovertemplate="<b>🔴 Arrêtés</b> : %{customdata:.0f}<extra></extra>",
+))
+
+fig_rcount.update_layout(
+    hovermode="x unified",          # tooltip unique qui affiche les deux valeurs
+    template="plotly_dark",
+    height=200,
+    margin=dict(l=60, r=30, t=20, b=30),
+    yaxis=dict(
+        title="Nb réacteurs",
+        range=[0, n_total + 4],
+        dtick=10,
+        gridcolor="rgba(180,180,180,0.15)",
+        tickfont=dict(size=11),
+    ),
+    xaxis=dict(showgrid=False),
+    legend=dict(
+        orientation="h",
+        yanchor="bottom", y=1.02,
+        xanchor="right",  x=1,
+        font=dict(size=11),
+    ),
+)
+
+st.plotly_chart(fig_rcount, use_container_width=True, theme=None)
+
+# ══════════════════════════════════════════════════════════════════
+# 8. MÉTRIQUES
 # ══════════════════════════════════════════════════════════════════
 
 st.markdown("---")
@@ -541,18 +896,18 @@ c5.metric("⚡ Puissance nominale parc", f"{serie_pnom.sum() / 1e3:.1f} GW")
 st.markdown("---")
 
 # ══════════════════════════════════════════════════════════════════
-# 8. HEATMAP
+# 9. HEATMAP
 # ══════════════════════════════════════════════════════════════════
 
 st.subheader("🔲 Heatmap — Taux de charge par réacteur (% Pnom)")
 st.caption("🟢 Vert = puissance nominale · ⚫ Noir = arrêt · 🟡 intermédiaire = modulation")
 
 COLORSCALE = [
-    [0.00, "rgb(5,5,5)"],    [0.04, "rgb(40,5,5)"],
-    [0.15, "rgb(120,20,0)"], [0.30, "rgb(180,60,0)"],
-    [0.45, "rgb(200,120,0)"],[0.60, "rgb(210,190,0)"],
-    [0.75, "rgb(170,210,30)"],[0.88, "rgb(80,200,40)"],
-    [0.95, "rgb(30,220,60)"], [0.99, "rgb(10,230,70)"],
+    [0.00, "rgb(5,5,5)"],     [0.04, "rgb(40,5,5)"],
+    [0.15, "rgb(120,20,0)"],  [0.30, "rgb(180,60,0)"],
+    [0.45, "rgb(200,120,0)"], [0.60, "rgb(210,190,0)"],
+    [0.75, "rgb(170,210,30)"], [0.88, "rgb(80,200,40)"],
+    [0.95, "rgb(30,220,60)"],  [0.99, "rgb(10,230,70)"],
     [1.00, "rgb(0,255,80)"],
 ]
 
@@ -564,7 +919,10 @@ fig_heatmap = go.Figure(go.Heatmap(
     y=reacteurs,
     colorscale=COLORSCALE, zmin=0, zmax=100, hoverongaps=False,
     hovertemplate="%{y}<br>%{x}<br>%{z:.1f} % Pnom<extra></extra>",
-    colorbar=dict(title="% Pnom", ticksuffix=" %", tickvals=[0, 25, 50, 75, 100], tickfont=dict(size=10)),
+    colorbar=dict(
+        title="% Pnom", ticksuffix=" %",
+        tickvals=[0, 25, 50, 75, 100], tickfont=dict(size=10),
+    ),
 ))
 fig_heatmap.update_layout(
     xaxis_title="",
@@ -576,7 +934,7 @@ fig_heatmap.update_layout(
 st.plotly_chart(fig_heatmap, use_container_width=True, theme=None)
 
 # ══════════════════════════════════════════════════════════════════
-# 9. SPARKLINES
+# 10. SPARKLINES
 # ══════════════════════════════════════════════════════════════════
 
 st.subheader("📈 Courbes individuelles — Taux de charge par réacteur")
@@ -633,15 +991,15 @@ fig_spark.update_yaxes(
 st.plotly_chart(fig_spark, use_container_width=True, theme=None)
 
 # ══════════════════════════════════════════════════════════════════
-# 10. TABLEAU & TÉLÉCHARGEMENT
+# 11. TABLEAU & TÉLÉCHARGEMENT
 # ══════════════════════════════════════════════════════════════════
 
 with st.expander("📋 Tableau — taux de charge par réacteur (dernière valeur)"):
     df_table = pd.DataFrame({
-        "Pnom (MWe)"         : serie_pnom,
-        "Production (MW)"    : prod_derniere.round(0),
+        "Pnom (MWe)"          : serie_pnom,
+        "Production (MW)"     : prod_derniere.round(0),
         "Taux de charge (%)": taux_derniere.round(1),
-        "État"               : taux_derniere.apply(
+        "État"                : taux_derniere.apply(
             lambda x: "✅ En marche" if x >= SEUIL_ON_PCT else "🔴 Arrêté"
         ),
     }).sort_values("Taux de charge (%)", ascending=False)
@@ -654,3 +1012,23 @@ with st.expander("📋 Télécharger les données (taux de charge %)"):
         file_name=f"modulation_nucleaire_FR_{start_date}_{end_date}.csv",
         mime="text/csv",
     )
+
+# ══════════════════════════════════════════════════════════════════
+# 12. SAUVEGARDE R2 — APRÈS L'AFFICHAGE
+# ══════════════════════════════════════════════════════════════════
+# Les graphiques sont déjà rendus. On enregistre maintenant les nouvelles
+# données sur Cloudflare R2 en un seul bloc atomique (download→merge→upload).
+
+if nouveaux_jours:
+    with st.spinner("💾 Sauvegarde vers Cloudflare R2…"):
+        sauvegarder_batch_en_r2(nouveaux_jours)
+    st.toast(
+        f"☁️ Cache R2 mis à jour — {len(nouveaux_jours)} jour(s) enregistrés",
+        icon="✅",
+    )
+
+# ── Réinitialisation de l'état de chargement ──────────────────────
+# Après ce rerun, is_loading=False → le bouton s'affichera "🔄 Rafraîchir"
+# lors du prochain rerun déclenché par une interaction utilisateur.
+st.session_state.is_loading  = False
+st.session_state.should_load = False

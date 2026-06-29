@@ -1,0 +1,6 @@
+streamlit
+pandas
+plotly
+entsoe-py
+pyarrow
+s3fs

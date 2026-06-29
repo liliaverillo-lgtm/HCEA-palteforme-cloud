@@ -141,10 +141,20 @@ _parquet_lock = threading.Lock()   # protège le cycle download-merge-upload R2
 # ══════════════════════════════════════════════════════════════════
 
 def _dedup_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Fusionne les colonnes dupliquées en prenant le max (patch ENTSO-E)."""
-    if df.columns.duplicated().any():
-        df = df.T.groupby(level=0).max().T
-    return df
+    """Fusionne les colonnes dupliquées en prenant le max element-wise (patch ENTSO-E).
+
+    Implémentation sans transposition : pour chaque nom de colonne, on sélectionne
+    toutes les colonnes portant ce nom et on en prend le max ligne par ligne.
+    Évite le double .T qui détruit l'organisation mémoire sur les grands DataFrames
+    et est incompatible avec groupby(axis=1) supprimé en pandas 2.x.
+    """
+    if not df.columns.duplicated().any():
+        return df
+    unique_cols = list(dict.fromkeys(df.columns))   # ordre préservé, doublons retirés
+    return pd.DataFrame(
+        {c: df.loc[:, df.columns == c].max(axis=1) for c in unique_cols},
+        index=df.index,
+    )
 
 
 def extraire_actual_aggregated(df: pd.DataFrame) -> pd.DataFrame:
@@ -508,14 +518,12 @@ div[data-baseweb="calendar"] button:disabled {
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session state : gestion du chargement ─────────────────────────
-# is_loading  : True pendant toute la durée du téléchargement + affichage + sauvegarde.
-#               Le bouton Rafraîchir est grisé tant que cette valeur est True.
-# should_load : True dans le rerun où le chargement doit effectivement se produire.
-# auto_loaded : True après le premier chargement automatique (évite une boucle infinie).
-for _k, _v in [("is_loading", False), ("should_load", False), ("auto_loaded", False)]:
-    if _k not in st.session_state:
-        st.session_state[_k] = _v
+# ── Session state ────────────────────────────────────────────────
+# last_render : dict avec le df_brut sérialisé + métadonnées de la dernière
+#               période chargée. Permet de réafficher les données quand
+#               l'utilisateur change les dates sans avoir recliqué Rafraîchir.
+if "last_render" not in st.session_state:
+    st.session_state.last_render = None
 
 # ── Sidebar ───────────────────────────────────────────────────────
 with st.sidebar:
@@ -553,38 +561,13 @@ with st.sidebar:
              "Valeurs élevées = plus rapide mais risque de throttling.",
     )
 
-    # ── Bouton Rafraîchir — grisé pendant le chargement ──────────
-    # Affiche « ⏳ Chargement… » et disabled=True quand is_loading=True.
-    # Cela est rendu VISIBLE dans le rerun qui suit le clic grâce à st.rerun().
-    if st.session_state.is_loading:
-        st.button(
-            "⏳ Chargement…",
-            type="primary",
-            use_container_width=True,
-            disabled=True,
-        )
-        lancer_clicked = False
-    else:
-        lancer_clicked = st.button(
-            "🔄 Rafraîchir",
-            type="primary",
-            use_container_width=True,
-        )
-
-    # Clic bouton → marquer chargement en cours et redémarrer
-    if lancer_clicked:
-        st.session_state.is_loading = True
-        st.session_state.should_load = True
-        st.rerun()
+    lancer = st.button("🔄 Rafraîchir", type="primary", use_container_width=True)
 
     with st.expander("🗑️ Gestion du cache"):
         st.caption("Force un re-téléchargement de la période sélectionnée.")
-        if st.button(
-            "Purger la période",
-            use_container_width=True,
-            disabled=st.session_state.is_loading,
-        ):
+        if st.button("Purger la période", use_container_width=True):
             n = purger_periode_r2(start_date, end_date)
+            st.session_state.last_render = None   # données affichées devenues obsolètes
             st.toast(f"🗑️ {n} jour(s) supprimés du cache R2", icon="✅")
 
     st.markdown("---")
@@ -603,22 +586,12 @@ with st.sidebar:
     )
 
 # ── Chargement automatique au premier affichage ───────────────────
-# Déclenche un premier rerun avec is_loading=True pour griser le bouton
-# AVANT que le chargement commence.
-if not st.session_state.auto_loaded and not st.session_state.should_load:
-    st.session_state.auto_loaded  = True
-    st.session_state.is_loading   = True
-    st.session_state.should_load  = True
-    st.rerun()
-
-if not st.session_state.should_load:
-    st.info("📅 Sélectionnez une nouvelle période et cliquez sur **Rafraîchir**.")
-    st.stop()
+if "premier_chargement" not in st.session_state:
+    st.session_state.premier_chargement = True
+    lancer = True
 
 if start_date > end_date:
     st.error("La date de début doit être antérieure à la date de fin.")
-    st.session_state.is_loading  = False
-    st.session_state.should_load = False
     st.stop()
 
 # ══════════════════════════════════════════════════════════════════
@@ -755,21 +728,52 @@ def charger_periode(
     return df, nb_cache, nb_ok, nouveaux_jours
 
 
-with st.spinner("⏳ Chargement des données…"):
-    try:
-        df_brut, nb_cache, nb_api, nouveaux_jours = charger_periode(
-            start_date, end_date, MAX_WORKERS_API
-        )
-    except Exception as exc:
-        st.session_state.is_loading  = False
-        st.session_state.should_load = False
-        st.error(f"Erreur : {exc}")
+if lancer:
+    # ── Chargement frais depuis ENTSO-E + cache R2 ────────────────
+    if start_date > end_date:
+        st.error("La date de début doit être antérieure à la date de fin.")
         st.stop()
 
-if df_brut is None or df_brut.empty:
-    st.session_state.is_loading  = False
-    st.session_state.should_load = False
-    st.error("Aucune donnée disponible pour cette période.")
+    with st.spinner("⏳ Chargement des données…"):
+        try:
+            df_brut, nb_cache, nb_api, nouveaux_jours = charger_periode(
+                start_date, end_date, MAX_WORKERS_API
+            )
+        except Exception as exc:
+            st.error(f"Erreur : {exc}")
+            st.stop()
+
+    if df_brut is None or df_brut.empty:
+        st.error("Aucune donnée disponible pour cette période.")
+        st.stop()
+
+    # Persister en session_state → permet de réafficher sans recharger
+    _buf = io.BytesIO()
+    df_brut.to_parquet(_buf)
+    st.session_state.last_render = {
+        "df_bytes"  : _buf.getvalue(),
+        "start"     : start_date,
+        "end"       : end_date,
+        "nb_cache"  : nb_cache,
+        "nb_api"    : nb_api,
+    }
+
+elif st.session_state.last_render is not None:
+    # ── Réaffichage sans rechargement (ex : changement de dates) ──
+    # On restaure les dernières données chargées. L'utilisateur voit les
+    # graphiques précédents et peut cliquer Rafraîchir pour la nouvelle période.
+    _lr        = st.session_state.last_render
+    df_brut    = pd.read_parquet(io.BytesIO(_lr["df_bytes"]))
+    start_date = _lr["start"]
+    end_date   = _lr["end"]
+    nb_jours   = (end_date - start_date).days + 1
+    nb_cache   = _lr["nb_cache"]
+    nb_api     = _lr["nb_api"]
+    nouveaux_jours = {}   # rien à sauvegarder
+
+else:
+    # ── Premier affichage (auto-load en cours, ne devrait pas arriver) ─
+    st.info("📅 Sélectionnez une période et cliquez sur **Rafraîchir**.")
     st.stop()
 
 st.success(
@@ -784,9 +788,7 @@ st.success(
 
 df_nuc = extraire_actual_aggregated(df_brut)
 df_nuc = df_nuc.dropna(axis=1, how="all")
-df_nuc = _dedup_columns(df_nuc)
-if df_nuc.columns.duplicated().any():
-    df_nuc = df_nuc.T.groupby(level=0).max().T
+df_nuc = _dedup_columns(df_nuc)   # efficient boolean-mask max, pas de transpose
 
 if nb_jours > 60:
     freq = "3h"
@@ -802,8 +804,6 @@ if df_nuc.empty or df_nuc.shape[1] == 0:
     st.error("Aucune donnée disponible après traitement.")
     with st.expander("Debug"):
         st.write(list(df_brut.columns)[:20])
-    st.session_state.is_loading  = False
-    st.session_state.should_load = False
     st.stop()
 
 reacteurs     = df_nuc.columns.tolist()
@@ -1026,9 +1026,3 @@ if nouveaux_jours:
         f"☁️ Cache R2 mis à jour — {len(nouveaux_jours)} jour(s) enregistrés",
         icon="✅",
     )
-
-# ── Réinitialisation de l'état de chargement ──────────────────────
-# Après ce rerun, is_loading=False → le bouton s'affichera "🔄 Rafraîchir"
-# lors du prochain rerun déclenché par une interaction utilisateur.
-st.session_state.is_loading  = False
-st.session_state.should_load = False

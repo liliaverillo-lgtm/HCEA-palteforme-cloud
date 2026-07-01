@@ -1023,9 +1023,11 @@ with st.expander("📋 Tableau — taux de charge par réacteur (dernière valeu
     }).sort_values("Taux de charge (%)", ascending=False)
     st.dataframe(df_table, use_container_width=True)
 
-with st.expander("📋 Télécharger les données (taux de charge %)"):
+ with st.expander("📋 Télécharger les données (taux de charge %)"):
     _buf_xl = io.BytesIO()
-    df_taux.to_excel(
+    df_export = df_taux.copy()
+    df_export.index = df_export.index.tz_localize(None)  # supprime la TZ pour Excel
+    df_export.to_excel(
         _buf_xl,
         index=True,
         engine="openpyxl",

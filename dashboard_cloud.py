@@ -1024,11 +1024,18 @@ with st.expander("📋 Tableau — taux de charge par réacteur (dernière valeu
     st.dataframe(df_table, use_container_width=True)
 
 with st.expander("📋 Télécharger les données (taux de charge %)"):
-    csv = df_taux.to_csv().encode("utf-8")
+    _buf_xl = io.BytesIO()
+    df_taux.to_excel(
+        _buf_xl,
+        index=True,
+        engine="openpyxl",
+        sheet_name="Taux de charge (%)",
+    )
     st.download_button(
-        "⬇️ CSV — taux de charge horaire par réacteur", csv,
-        file_name=f"modulation_nucleaire_FR_{start_date}_{end_date}.csv",
-        mime="text/csv",
+        "⬇️ Excel — taux de charge horaire par réacteur",
+        _buf_xl.getvalue(),
+        file_name=f"modulation_nucleaire_FR_{start_date}_{end_date}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 # ══════════════════════════════════════════════════════════════════

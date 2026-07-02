@@ -7,10 +7,14 @@ Normalisation par la puissance nominale IAEA PRIS
 CACHE CLOUDFLARE R2  (Parquet + JSON)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Les données sont persistées sur Cloudflare R2 (API S3-compatible) :
-  nucleaire_production.parquet  — production par réacteur (wide format,
-                                  index DatetimeTZ Europe/Paris)
-  nucleaire_jours.json          — métadonnées des jours chargés
-                                  {jour_str: {charge_ts, est_complet}}
+  nucleaire_production.parquet     — production par réacteur (wide format,
+                                     index DatetimeTZ Europe/Paris)
+  nucleaire_jours.json             — métadonnées des jours chargés
+                                     {jour_str: {charge_ts, est_complet}}
+  remit_indispo_nucleaire.parquet  — historique REMIT des indisponibilités EDF
+                                     (arrêts fortuits/planifiés, chroniques
+                                     PMIN/aFRR/simples). Déposé une fois sur R2
+                                     via la sidebar, lu à chaque chargement.
 
 Flux de mise à jour :
   1. L'app télécharge le Parquet R2 en mémoire (BytesIO) — < 1 s.
@@ -108,6 +112,24 @@ MAX_SHAPES        = 56   # limite des hlines décoratifs dans les sparklines
 # ── Clés des objets R2 ────────────────────────────────────────────
 R2_PARQUET_KEY = "nucleaire_production.parquet"
 R2_META_KEY    = "nucleaire_jours.json"
+# Historique des indisponibilités REMIT (EDF) — même bucket que la production.
+# Ce fichier est déposé une fois sur R2 (upload manuel ou via la sidebar).
+R2_REMIT_KEY   = "remit_indispo_nucleaire.parquet"
+
+# ── Catégories d'indisponibilité REMIT ────────────────────────────
+# Ordre = priorité d'affectation : un réacteur qui cumule plusieurs
+# déclarations actives au même instant est compté dans la catégorie la
+# plus « haute » de cette liste (un arrêt prime sur une chronique).
+# Chaque entrée : clé interne → (libellé, couleur, types REMIT regroupés)
+REMIT_CATEGORIES = {
+    "fortuit"   : ("Arrêt fortuit",    "#E53935", {"Fortuite", "Fortuite (pompe)"}),
+    "planifie"  : ("Arrêt planifié",   "#FB8C00", {"Planifiée", "Planifiée (pompe)"}),
+    "pmin"      : ("Chronique PMIN",   "#FDD835", {"Chronique PMIN"}),
+    "afrr"      : ("Chronique aFRR",   "#42A5F5", {"Chronique aFRR"}),
+    "chronique" : ("Chronique simple", "#26A69A", {"Chronique", "Chronique."}),
+}
+# Priorité décroissante (le 1er qui matche gagne)
+REMIT_PRIORITE = ["fortuit", "planifie", "pmin", "afrr", "chronique"]
 
 PUISSANCE_NOMINALE_MW = {
     "BUGEY 2": 910,      "BUGEY 3": 910,      "BUGEY 4": 880,      "BUGEY 5": 880,
@@ -454,6 +476,151 @@ def purger_periode_r2(start: date, end: date) -> int:
     return len(jours)
 
 # ══════════════════════════════════════════════════════════════════
+# 2bis. DONNÉES REMIT (indisponibilités EDF)
+# ══════════════════════════════════════════════════════════════════
+
+def _remit_col(df: pd.DataFrame, *candidats: str) -> str:
+    """Retrouve le nom exact d'une colonne malgré le mojibake (é→È, è→Ë).
+
+    L'export REMIT contient des accents mal encodés ('FiliËre', 'Date de dÈbut').
+    On compare en supprimant les caractères non-ASCII pour être robuste.
+    """
+    def norm(s: str) -> str:
+        # ne garde que a-z / 0-9 → ignore accents ET mojibake (é, È, è…)
+        return "".join(c for c in s.lower() if c.isascii() and c.isalnum())
+    cibles = {norm(c) for c in candidats}
+    for col in df.columns:
+        if norm(col) in cibles:
+            return col
+    raise KeyError(f"Colonne introuvable parmi {candidats} · dispo : {list(df.columns)}")
+
+
+@st.cache_data(show_spinner=False)
+def charger_remit() -> pd.DataFrame:
+    """Charge et normalise l'historique REMIT nucléaire depuis R2.
+
+    Retourne un DataFrame trié avec colonnes normalisées :
+      nom · type · cat · deb · fin · status
+    où 'cat' est la clé de catégorie (fortuit/planifie/pmin/afrr/chronique).
+    Ne conserve que les déclarations Actives de la filière nucléaire.
+    DataFrame vide si le fichier REMIT est absent sur R2.
+    """
+    data = _r2_download(R2_REMIT_KEY)
+    if data is None:
+        return pd.DataFrame()
+    try:
+        raw = pd.read_parquet(io.BytesIO(data))
+    except Exception:
+        return pd.DataFrame()
+    if raw.empty:
+        return pd.DataFrame()
+
+    c_status = _remit_col(raw, "Status")
+    c_nom    = _remit_col(raw, "Nom")
+    c_fil    = _remit_col(raw, "Filiere", "FiliÈre", "FiliËre")
+    c_deb    = _remit_col(raw, "Date de debut", "Date de dÈbut")
+    c_fin    = _remit_col(raw, "Date de fin")
+    c_type   = _remit_col(raw, "Type")
+
+    df = raw[[c_status, c_nom, c_fil, c_deb, c_fin, c_type]].copy()
+    df.columns = ["status", "nom", "filiere", "deb", "fin", "type"]
+
+    # Filtre nucléaire + déclarations actives uniquement
+    df = df[df["filiere"].astype(str).str.contains("ucl", case=False, na=False)]
+    df = df[df["status"].astype(str).str.strip().str.lower() == "active"]
+    if df.empty:
+        return pd.DataFrame()
+
+    # Dates : sérial Excel (float) OU déjà datetime selon l'export
+    for col in ("deb", "fin"):
+        if pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = pd.to_datetime(df[col], unit="D", origin="1899-12-30")
+        else:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    df = df.dropna(subset=["deb", "fin"])
+
+    # Localisation Europe/Paris (les dates REMIT sont en heure locale FR)
+    for col in ("deb", "fin"):
+        if df[col].dt.tz is None:
+            df[col] = df[col].dt.tz_localize(TZ, ambiguous="NaT", nonexistent="shift_forward")
+        else:
+            df[col] = df[col].dt.tz_convert(TZ)
+    df = df.dropna(subset=["deb", "fin"])
+
+    # Affectation d'une catégorie à chaque déclaration.
+    # L'export REMIT peut contenir des accents mal encodés dans les valeurs
+    # de 'Type' ('PlanifiÈe' au lieu de 'Planifiée'). On normalise donc en
+    # supprimant les caractères non alphanumériques ASCII avant de comparer.
+    def _norm_type(s: str) -> str:
+        # ne garde que a-z / 0-9 → 'Planifiée' == 'PlanifiÈe' (mojibake)
+        return "".join(c for c in str(s).lower() if c.isascii() and c.isalnum())
+
+    type_to_cat = {}
+    for cat, (_lib, _col, types) in REMIT_CATEGORIES.items():
+        for t in types:
+            type_to_cat[_norm_type(t)] = cat
+
+    df["type"] = df["type"].astype(str).str.strip()
+    df["cat"]  = df["type"].map(lambda t: type_to_cat.get(_norm_type(t)))
+    df = df.dropna(subset=["cat"])
+
+    return df.sort_values("deb").reset_index(drop=True)
+
+
+def compter_indispo_par_categorie(
+    remit: pd.DataFrame, axe_temps: pd.DatetimeIndex
+) -> pd.DataFrame:
+    """Compte les réacteurs indisponibles par catégorie, à chaque pas de temps.
+
+    Pour chaque instant de `axe_temps`, on regarde toutes les déclarations REMIT
+    actives qui le recouvrent (deb ≤ t < fin). Un réacteur qui cumule plusieurs
+    déclarations au même instant est affecté à UNE seule catégorie, selon
+    REMIT_PRIORITE (un arrêt prime sur une chronique). On compte donc des
+    réacteurs distincts — pas des déclarations — pour éviter le double comptage.
+
+    Retourne un DataFrame indexé par axe_temps, une colonne par catégorie
+    (libellés lisibles), valeurs = nombre de réacteurs.
+    """
+    libelles = {cat: REMIT_CATEGORIES[cat][0] for cat in REMIT_PRIORITE}
+    out = pd.DataFrame(
+        0, index=axe_temps, columns=[libelles[c] for c in REMIT_PRIORITE], dtype=int
+    )
+    if remit.empty:
+        return out
+
+    rang = {cat: i for i, cat in enumerate(REMIT_PRIORITE)}
+    deb = remit["deb"].values
+    fin = remit["fin"].values
+    noms = remit["nom"].values
+    cats = remit["cat"].values
+
+    for t in axe_temps:
+        tv = pd.Timestamp(t).to_datetime64()
+        mask = (deb <= tv) & (fin > tv)
+        if not mask.any():
+            continue
+        # meilleure catégorie (plus prioritaire) par réacteur
+        best: dict[str, int] = {}
+        for nom, cat in zip(noms[mask], cats[mask]):
+            r = rang[cat]
+            if nom not in best or r < best[nom]:
+                best[nom] = r
+        # agrégation par catégorie
+        compte = [0] * len(REMIT_PRIORITE)
+        for r in best.values():
+            compte[r] += 1
+        for i, cat in enumerate(REMIT_PRIORITE):
+            out.at[t, libelles[cat]] = compte[i]
+
+    return out
+
+
+def uploader_remit_vers_r2(file_bytes: bytes) -> None:
+    """Dépose le fichier REMIT (.parquet) sur R2 et invalide le cache de lecture."""
+    _r2_upload(R2_REMIT_KEY, file_bytes)
+    charger_remit.clear()
+
+# ══════════════════════════════════════════════════════════════════
 # 3. API ENTSO-E
 # ══════════════════════════════════════════════════════════════════
 
@@ -587,6 +754,23 @@ with st.sidebar:
             st.session_state.last_render = None   # données affichées devenues obsolètes
             stats_r2.clear()                      # rafraîchit les stats sidebar immédiatement
             st.toast(f"🗑️ {n} jour(s) supprimés du cache R2", icon="✅")
+
+    with st.expander("📥 Données REMIT (indispo. EDF)"):
+        remit_present = _r2_exists(R2_REMIT_KEY)
+        if remit_present:
+            st.caption("✅ Fichier REMIT présent sur R2.")
+        else:
+            st.caption("⚠️ Aucun fichier REMIT sur R2. Déposez le .parquet ci-dessous.")
+        up = st.file_uploader(
+            "Historique des indisponibilités (.parquet)",
+            type=["parquet"],
+            help="Export EDF converti en Parquet. Déposé une fois sur R2, "
+                 "il est ensuite lu automatiquement à chaque chargement.",
+        )
+        if up is not None and st.button("☁️ Envoyer vers R2", use_container_width=True):
+            uploader_remit_vers_r2(up.getvalue())
+            st.toast("☁️ Fichier REMIT enregistré sur R2", icon="✅")
+            st.rerun()
 
     st.markdown("---")
     info = stats_r2()
@@ -899,6 +1083,125 @@ fig_rcount.update_layout(
 )
 
 st.plotly_chart(fig_rcount, use_container_width=True, theme=None)
+
+# ══════════════════════════════════════════════════════════════════
+# 7bis. INDISPONIBILITÉS REMIT PAR CATÉGORIE
+# ══════════════════════════════════════════════════════════════════
+
+st.subheader("🗂️ Indisponibilités déclarées par catégorie (REMIT EDF)")
+st.caption(
+    "Nombre de réacteurs concernés par une déclaration active à chaque instant · "
+    "🔴 Fortuit · 🟠 Planifié · 🟡 PMIN · 🔵 aFRR · 🟢 Chronique simple"
+)
+
+remit = charger_remit()
+
+if remit.empty:
+    st.info(
+        "📥 Aucune donnée REMIT chargée. Déposez l'export EDF (.parquet) via "
+        "**la sidebar → 📥 Données REMIT** pour activer ce graphique."
+    )
+else:
+    # Axe de temps = celui de la production (résolution adaptive déjà appliquée)
+    df_remit_counts = compter_indispo_par_categorie(remit, df_nuc.index)
+
+    fig_remit = go.Figure()
+    for cat in REMIT_PRIORITE:
+        libelle, couleur, _types = REMIT_CATEGORIES[cat]
+        fig_remit.add_trace(go.Scatter(
+            x=df_remit_counts.index,
+            y=df_remit_counts[libelle].values,
+            name=libelle,
+            mode="lines",
+            stackgroup="remit",            # empilement des catégories
+            line=dict(width=0.5, color=couleur),
+            fillcolor=couleur,
+            hovertemplate=f"<b>{libelle}</b> : " + "%{y} réacteurs<extra></extra>",
+        ))
+
+    fig_remit.update_layout(
+        hovermode="x unified",
+        template="plotly_dark",
+        height=340,
+        margin=dict(l=60, r=30, t=20, b=30),
+        yaxis=dict(
+            title="Nb réacteurs",
+            gridcolor="rgba(180,180,180,0.15)",
+            tickfont=dict(size=11),
+        ),
+        xaxis=dict(showgrid=False),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=1.02,
+            xanchor="right",  x=1,
+            font=dict(size=11),
+        ),
+    )
+    st.plotly_chart(fig_remit, use_container_width=True, theme=None)
+
+    with st.expander("ℹ️ Comment lire ce graphique"):
+        st.markdown(
+            "- Chaque réacteur est compté **une seule fois** par instant, dans sa "
+            "catégorie la plus prioritaire (fortuit > planifié > PMIN > aFRR > "
+            "chronique simple), afin d'éviter le double comptage quand plusieurs "
+            "déclarations se chevauchent.\n"
+            "- **Arrêt fortuit** : indisponibilité non programmée (défaillance).\n"
+            "- **Arrêt planifié** : maintenance / rechargement programmés.\n"
+            "- **Chronique PMIN** : réacteur contraint à son plancher technique.\n"
+            "- **Chronique aFRR** : réacteur en retrait pour fournir la réserve "
+            "secondaire de fréquence.\n"
+            "- **Chronique simple** : autre modulation programmée."
+        )
+
+# ══════════════════════════════════════════════════════════════════
+# 7ter. PUISSANCE RÉELLE / PUISSANCE NOMINALE DU PARC (%)
+# ══════════════════════════════════════════════════════════════════
+
+st.subheader("📉 Taux d'utilisation du parc — Puissance réelle / Pnom totale")
+pnom_totale = float(serie_pnom.sum())
+st.caption(
+    f"Somme de la production réelle rapportée à la puissance nominale installée "
+    f"du parc ({pnom_totale / 1e3:.1f} GW)"
+)
+
+# Production totale du parc à chaque instant / Pnom totale → %
+prod_totale_ts = df_nuc.sum(axis=1)
+taux_parc_ts   = (prod_totale_ts / pnom_totale * 100).clip(upper=105)
+
+fig_parc = go.Figure()
+fig_parc.add_trace(go.Scatter(
+    x=taux_parc_ts.index,
+    y=taux_parc_ts.values,
+    mode="lines",
+    line=dict(color="#00C853", width=2),
+    fill="tozeroy",
+    fillcolor="rgba(0,200,83,0.15)",
+    name="Taux d'utilisation",
+    hovertemplate="%{x}<br><b>%{y:.1f} %</b> de la Pnom parc<extra></extra>",
+))
+# Ligne moyenne de la période
+moyenne_parc = float(taux_parc_ts.mean())
+fig_parc.add_hline(
+    y=moyenne_parc,
+    line=dict(color="#FDD835", width=1, dash="dash"),
+    annotation_text=f"Moyenne : {moyenne_parc:.1f} %",
+    annotation_position="top left",
+    annotation_font_color="#FDD835",
+)
+fig_parc.update_layout(
+    template="plotly_dark",
+    height=300,
+    margin=dict(l=60, r=30, t=20, b=30),
+    yaxis=dict(
+        title="% Pnom parc",
+        ticksuffix=" %",
+        range=[0, 105],
+        gridcolor="rgba(180,180,180,0.15)",
+        tickfont=dict(size=11),
+    ),
+    xaxis=dict(showgrid=False),
+)
+st.plotly_chart(fig_parc, use_container_width=True, theme=None)
 
 # ══════════════════════════════════════════════════════════════════
 # 8. MÉTRIQUES

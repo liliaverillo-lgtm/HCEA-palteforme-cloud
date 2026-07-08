@@ -1315,6 +1315,35 @@ st.plotly_chart(fig_spark, use_container_width=True, theme=None)
 # 11. TABLEAU & TÉLÉCHARGEMENT
 # ══════════════════════════════════════════════════════════════════
 
+# ── Générateurs de fichiers (mis en cache : régénérés seulement si les
+#    données changent, pour ne pas ralentir chaque rerun Streamlit) ─────
+def _prod_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """DataFrame production (MW) → .xlsx : index sans timezone, inf nettoyés."""
+    out = df.copy()
+    if getattr(out.index, "tz", None) is not None:
+        out.index = out.index.tz_convert(TZ).tz_localize(None)
+    out.index.name = "timestamp (heure Paris)"
+    for c in out.columns:
+        if isinstance(out[c].dtype, pd.DatetimeTZDtype):
+            out[c] = out[c].dt.tz_localize(None)
+    out = out.replace([float("inf"), float("-inf")], pd.NA)
+    buf = io.BytesIO()
+    out.to_excel(buf, engine="openpyxl", sheet_name="Production (MW)")
+    return buf.getvalue()
+
+
+@st.cache_data(show_spinner="Génération Excel…")
+def build_excel_prod(df: pd.DataFrame) -> bytes:
+    return _prod_to_excel_bytes(df)
+
+
+@st.cache_data(show_spinner="Génération Parquet…")
+def build_parquet_prod(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    df.to_parquet(buf)
+    return buf.getvalue()
+
+
 with st.expander("📋 Tableau — taux de charge par réacteur (dernière valeur)"):
     df_table = pd.DataFrame({
         "Pnom (MWe)"          : serie_pnom,
@@ -1326,22 +1355,69 @@ with st.expander("📋 Tableau — taux de charge par réacteur (dernière valeu
     }).sort_values("Taux de charge (%)", ascending=False)
     st.dataframe(df_table, use_container_width=True)
 
-with st.expander("📋 Télécharger les données (taux de charge %)"):
-    _buf_xl = io.BytesIO()
-    _df_export = df_taux.copy()
-    _df_export.index = _df_export.index.tz_localize(None)  # Excel ne gère pas les TZ
-    _df_export.to_excel(
-        _buf_xl,
-        index=True,
-        engine="openpyxl",
-        sheet_name="Taux de charge (%)",
-    )
-    st.download_button(
-        "⬇️ Excel — taux de charge horaire par réacteur",
-        _buf_xl.getvalue(),
-        file_name=f"modulation_nucleaire_FR_{start_date}_{end_date}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+with st.expander("💾 Télécharger les données source (production par réacteur, MW)"):
+    df_source_full = _charger_parquet_complet_cached()
+
+    if df_source_full is None or df_source_full.empty:
+        st.caption("Aucune donnée source disponible dans le cache R2.")
+    else:
+        _n_jours_dl = df_source_full.index.normalize().nunique()
+        st.caption(
+            f"Base source : {df_source_full.shape[1]} réacteurs · "
+            f"{df_source_full.shape[0]:,} lignes · {_n_jours_dl} jours téléchargés · "
+            f"{df_source_full.index.min():%d/%m/%Y} → {df_source_full.index.max():%d/%m/%Y}"
+        )
+
+        # ── 1 & 2 : toute la base (tous les jours téléchargés) ────────────
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            st.download_button(
+                "⬇️ Parquet — tous les jours téléchargés",
+                data=build_parquet_prod(df_source_full),
+                file_name="nucleaire_production_FR.parquet",
+                mime="application/octet-stream",
+                use_container_width=True,
+                help="Données source brutes (production MW). Recommandé pour Python/Pandas.",
+            )
+            st.caption("⚡ Rapide · Pour Python")
+        with col_dl2:
+            st.download_button(
+                "⬇️ Excel — tous les jours téléchargés",
+                data=build_excel_prod(df_source_full),
+                file_name="nucleaire_production_FR.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                help="Toute la base source (tous les jours téléchargés) au format Excel.",
+            )
+            st.caption("📊 Excel · Tous les jours")
+
+        # ── 3 : période sélectionnée uniquement ──────────────────────────
+        st.markdown("---")
+        df_source_periode = charger_depuis_parquet_cache(start_date, end_date)
+        col_dl3, col_dl4 = st.columns(2)
+        with col_dl3:
+            if df_source_periode is None or df_source_periode.empty:
+                st.button(
+                    "⬇️ Excel — période sélectionnée",
+                    disabled=True, use_container_width=True,
+                    help="Aucune donnée source pour cette période.",
+                )
+            else:
+                st.download_button(
+                    "⬇️ Excel — période sélectionnée",
+                    data=build_excel_prod(df_source_periode),
+                    file_name=f"nucleaire_production_FR_{start_date}_{end_date}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    help=f"Production source du {start_date} au {end_date}.",
+                )
+        with col_dl4:
+            _n_reac = (df_source_periode.shape[1]
+                       if df_source_periode is not None and not df_source_periode.empty else 0)
+            st.caption(
+                f"Période : {start_date:%d/%m/%Y} → {end_date:%d/%m/%Y}\n\n"
+                f"Réacteurs : {_n_reac}"
+            )
 
 # ══════════════════════════════════════════════════════════════════
 # 12. SAUVEGARDE R2 — APRÈS L'AFFICHAGE

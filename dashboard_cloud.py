@@ -1318,23 +1318,37 @@ st.plotly_chart(fig_spark, use_container_width=True, theme=None)
 # ── Générateurs de fichiers (mis en cache : régénérés seulement si les
 #    données changent, pour ne pas ralentir chaque rerun Streamlit) ─────
 def _prod_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    """DataFrame production (MW) → .xlsx : index sans timezone, inf nettoyés."""
+    """DataFrame production (MW) → .xlsx en mémoire quasi constante.
+
+    Utilise xlsxwriter en mode `constant_memory` (écriture ligne par ligne,
+    ~25× moins de RAM qu'openpyxl) pour supporter de grandes bases sans
+    saturer la mémoire de Streamlit Cloud. Repli openpyxl si xlsxwriter absent.
+    """
     out = df.copy()
     # Colonnes dupliquées éventuelles (patch ENTSO-E) -> fusion max
     if out.columns.duplicated().any():
         out = _dedup_columns(out)
-    # Aplatir un éventuel MultiIndex de colonnes (sinon en-têtes illisibles)
+    # Aplatir un éventuel MultiIndex de colonnes
     if isinstance(out.columns, pd.MultiIndex):
         out.columns = [" / ".join(str(x) for x in tup) for tup in out.columns]
     if getattr(out.index, "tz", None) is not None:
         out.index = out.index.tz_convert(TZ).tz_localize(None)
     out.index.name = "timestamp (heure Paris)"
-    # Retirer le fuseau d'éventuelles colonnes datetime tz-aware
     for c in out.select_dtypes(include=["datetimetz"]).columns:
         out[c] = out[c].dt.tz_localize(None)
     out = out.replace([float("inf"), float("-inf")], pd.NA)
+
     buf = io.BytesIO()
-    out.to_excel(buf, engine="openpyxl", sheet_name="Production (MW)")
+    try:
+        with pd.ExcelWriter(
+            buf, engine="xlsxwriter",
+            engine_kwargs={"options": {"constant_memory": True}},
+        ) as writer:
+            out.to_excel(writer, sheet_name="Production (MW)")
+    except Exception:
+        # Repli si xlsxwriter n'est pas installé (⚠️ RAM plus élevée)
+        buf = io.BytesIO()
+        out.to_excel(buf, engine="openpyxl", sheet_name="Production (MW)")
     return buf.getvalue()
 
 

@@ -1338,23 +1338,10 @@ def _prod_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
-@st.cache_data(show_spinner="Génération Excel…", max_entries=3)
-def build_excel_prod(_df: pd.DataFrame, cache_key: tuple) -> bytes:
-    """_df n'est PAS hashé par Streamlit (préfixe _) : on évite de hasher
-    toute la base à chaque rerun. cache_key (léger) invalide le cache."""
-    return _prod_to_excel_bytes(_df)
-
-
-@st.cache_data(show_spinner="Génération Parquet…", max_entries=2)
-def build_parquet_prod(_df: pd.DataFrame, cache_key: tuple) -> bytes:
+def _prod_to_parquet_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
-    _df.to_parquet(buf)
+    df.to_parquet(buf)
     return buf.getvalue()
-
-
-def _df_cache_key(df: pd.DataFrame) -> tuple:
-    """Clé de cache légère : dimensions + bornes temporelles."""
-    return (df.shape, str(df.index.min()), str(df.index.max()))
 
 
 with st.expander("📋 Tableau — taux de charge par réacteur (dernière valeur)"):
@@ -1375,7 +1362,6 @@ with st.expander("💾 Télécharger les données source (production par réacte
         if df_source_full is None or df_source_full.empty:
             st.caption("Aucune donnée source disponible dans le cache R2.")
         else:
-            _key_full = _df_cache_key(df_source_full)
             try:
                 _n_jours_dl = df_source_full.index.normalize().nunique()
             except Exception:
@@ -1385,12 +1371,17 @@ with st.expander("💾 Télécharger les données source (production par réacte
                 f"{df_source_full.shape[0]:,} lignes · {_n_jours_dl} jours téléchargés"
             )
 
+            # NOTE : data=callable (Streamlit ≥ 1.52) → le fichier n'est
+            # généré QUE lorsque l'utilisateur clique, jamais au chargement
+            # de la page. Indispensable ici : générer l'Excel de toute la
+            # base à chaque rerun saturait la mémoire de Streamlit Cloud.
+
             # ── 1 & 2 : toute la base (tous les jours téléchargés) ────────
             col_dl1, col_dl2 = st.columns(2)
             with col_dl1:
                 st.download_button(
                     "⬇️ Parquet — tous les jours téléchargés",
-                    data=build_parquet_prod(df_source_full, _key_full),
+                    data=lambda df=df_source_full: _prod_to_parquet_bytes(df),
                     file_name="nucleaire_production_FR.parquet",
                     mime="application/octet-stream",
                     use_container_width=True,
@@ -1400,11 +1391,12 @@ with st.expander("💾 Télécharger les données source (production par réacte
             with col_dl2:
                 st.download_button(
                     "⬇️ Excel — tous les jours téléchargés",
-                    data=build_excel_prod(df_source_full, _key_full),
+                    data=lambda df=df_source_full: _prod_to_excel_bytes(df),
                     file_name="nucleaire_production_FR.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
-                    help="Toute la base source (tous les jours téléchargés) au format Excel.",
+                    help="Toute la base source au format Excel. La génération se "
+                         "lance au clic et peut prendre quelques secondes.",
                 )
                 st.caption("📊 Excel · Tous les jours")
 
@@ -1422,8 +1414,7 @@ with st.expander("💾 Télécharger les données source (production par réacte
                 else:
                     st.download_button(
                         "⬇️ Excel — période sélectionnée",
-                        data=build_excel_prod(df_source_periode,
-                                              _df_cache_key(df_source_periode)),
+                        data=lambda df=df_source_periode: _prod_to_excel_bytes(df),
                         file_name=f"nucleaire_production_FR_{start_date}_{end_date}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,

@@ -1338,16 +1338,23 @@ def _prod_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
-@st.cache_data(show_spinner="Génération Excel…")
-def build_excel_prod(df: pd.DataFrame) -> bytes:
-    return _prod_to_excel_bytes(df)
+@st.cache_data(show_spinner="Génération Excel…", max_entries=3)
+def build_excel_prod(_df: pd.DataFrame, cache_key: tuple) -> bytes:
+    """_df n'est PAS hashé par Streamlit (préfixe _) : on évite de hasher
+    toute la base à chaque rerun. cache_key (léger) invalide le cache."""
+    return _prod_to_excel_bytes(_df)
 
 
-@st.cache_data(show_spinner="Génération Parquet…")
-def build_parquet_prod(df: pd.DataFrame) -> bytes:
+@st.cache_data(show_spinner="Génération Parquet…", max_entries=2)
+def build_parquet_prod(_df: pd.DataFrame, cache_key: tuple) -> bytes:
     buf = io.BytesIO()
-    df.to_parquet(buf)
+    _df.to_parquet(buf)
     return buf.getvalue()
+
+
+def _df_cache_key(df: pd.DataFrame) -> tuple:
+    """Clé de cache légère : dimensions + bornes temporelles."""
+    return (df.shape, str(df.index.min()), str(df.index.max()))
 
 
 with st.expander("📋 Tableau — taux de charge par réacteur (dernière valeur)"):
@@ -1362,77 +1369,77 @@ with st.expander("📋 Tableau — taux de charge par réacteur (dernière valeu
     st.dataframe(df_table, use_container_width=True)
 
 with st.expander("💾 Télécharger les données source (production par réacteur, MW)"):
-    df_source_full = _charger_parquet_complet_cached()
+    try:
+        df_source_full = _charger_parquet_complet_cached()
 
-    if df_source_full is None or df_source_full.empty:
-        st.caption("Aucune donnée source disponible dans le cache R2.")
-    else:
-        _n_jours_dl = df_source_full.index.normalize().nunique()
-        st.caption(
-            f"Base source : {df_source_full.shape[1]} réacteurs · "
-            f"{df_source_full.shape[0]:,} lignes · {_n_jours_dl} jours téléchargés · "
-            f"{df_source_full.index.min():%d/%m/%Y} → {df_source_full.index.max():%d/%m/%Y}"
-        )
-
-        # ── 1 & 2 : toute la base (tous les jours téléchargés) ────────────
-        col_dl1, col_dl2 = st.columns(2)
-        with col_dl1:
+        if df_source_full is None or df_source_full.empty:
+            st.caption("Aucune donnée source disponible dans le cache R2.")
+        else:
+            _key_full = _df_cache_key(df_source_full)
             try:
+                _n_jours_dl = df_source_full.index.normalize().nunique()
+            except Exception:
+                _n_jours_dl = "?"
+            st.caption(
+                f"Base source : {df_source_full.shape[1]} réacteurs · "
+                f"{df_source_full.shape[0]:,} lignes · {_n_jours_dl} jours téléchargés"
+            )
+
+            # ── 1 & 2 : toute la base (tous les jours téléchargés) ────────
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
                 st.download_button(
                     "⬇️ Parquet — tous les jours téléchargés",
-                    data=build_parquet_prod(df_source_full),
+                    data=build_parquet_prod(df_source_full, _key_full),
                     file_name="nucleaire_production_FR.parquet",
                     mime="application/octet-stream",
                     use_container_width=True,
                     help="Données source brutes (production MW). Recommandé pour Python/Pandas.",
                 )
                 st.caption("⚡ Rapide · Pour Python")
-            except Exception as e:
-                st.warning(f"Parquet indisponible : {e}")
-        with col_dl2:
-            try:
+            with col_dl2:
                 st.download_button(
                     "⬇️ Excel — tous les jours téléchargés",
-                    data=build_excel_prod(df_source_full),
+                    data=build_excel_prod(df_source_full, _key_full),
                     file_name="nucleaire_production_FR.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                     help="Toute la base source (tous les jours téléchargés) au format Excel.",
                 )
                 st.caption("📊 Excel · Tous les jours")
-            except Exception as e:
-                st.warning(f"Excel (base complète) indisponible : {e}")
 
-        # ── 3 : période sélectionnée uniquement ──────────────────────────
-        st.markdown("---")
-        df_source_periode = charger_depuis_parquet_cache(start_date, end_date)
-        col_dl3, col_dl4 = st.columns(2)
-        with col_dl3:
-            if df_source_periode is None or df_source_periode.empty:
-                st.button(
-                    "⬇️ Excel — période sélectionnée",
-                    disabled=True, use_container_width=True,
-                    help="Aucune donnée source pour cette période.",
-                )
-            else:
-                try:
+            # ── 3 : période sélectionnée uniquement ──────────────────────
+            st.markdown("---")
+            df_source_periode = charger_depuis_parquet_cache(start_date, end_date)
+            col_dl3, col_dl4 = st.columns(2)
+            with col_dl3:
+                if df_source_periode is None or df_source_periode.empty:
+                    st.button(
+                        "⬇️ Excel — période sélectionnée",
+                        disabled=True, use_container_width=True,
+                        help="Aucune donnée source pour cette période.",
+                    )
+                else:
                     st.download_button(
                         "⬇️ Excel — période sélectionnée",
-                        data=build_excel_prod(df_source_periode),
+                        data=build_excel_prod(df_source_periode,
+                                              _df_cache_key(df_source_periode)),
                         file_name=f"nucleaire_production_FR_{start_date}_{end_date}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                         help=f"Production source du {start_date} au {end_date}.",
                     )
-                except Exception as e:
-                    st.warning(f"Excel (période) indisponible : {e}")
-        with col_dl4:
-            _n_reac = (df_source_periode.shape[1]
-                       if df_source_periode is not None and not df_source_periode.empty else 0)
-            st.caption(
-                f"Période : {start_date:%d/%m/%Y} → {end_date:%d/%m/%Y}\n\n"
-                f"Réacteurs : {_n_reac}"
-            )
+            with col_dl4:
+                _n_reac = (df_source_periode.shape[1]
+                           if df_source_periode is not None
+                           and not df_source_periode.empty else 0)
+                st.caption(
+                    f"Période : {start_date:%d/%m/%Y} → {end_date:%d/%m/%Y}\n\n"
+                    f"Réacteurs : {_n_reac}"
+                )
+    except Exception as _e_dl:
+        # Filet de sécurité : une erreur ici ne doit jamais tuer le dashboard.
+        st.warning(f"⚠️ Section téléchargement indisponible : {type(_e_dl).__name__} — {_e_dl}")
 
 # ══════════════════════════════════════════════════════════════════
 # 12. SAUVEGARDE R2 — APRÈS L'AFFICHAGE

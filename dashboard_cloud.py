@@ -1320,12 +1320,18 @@ st.plotly_chart(fig_spark, use_container_width=True, theme=None)
 def _prod_to_excel_bytes(df: pd.DataFrame) -> bytes:
     """DataFrame production (MW) → .xlsx : index sans timezone, inf nettoyés."""
     out = df.copy()
+    # Colonnes dupliquées éventuelles (patch ENTSO-E) -> fusion max
+    if out.columns.duplicated().any():
+        out = _dedup_columns(out)
+    # Aplatir un éventuel MultiIndex de colonnes (sinon en-têtes illisibles)
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [" / ".join(str(x) for x in tup) for tup in out.columns]
     if getattr(out.index, "tz", None) is not None:
         out.index = out.index.tz_convert(TZ).tz_localize(None)
     out.index.name = "timestamp (heure Paris)"
-    for c in out.columns:
-        if isinstance(out[c].dtype, pd.DatetimeTZDtype):
-            out[c] = out[c].dt.tz_localize(None)
+    # Retirer le fuseau d'éventuelles colonnes datetime tz-aware
+    for c in out.select_dtypes(include=["datetimetz"]).columns:
+        out[c] = out[c].dt.tz_localize(None)
     out = out.replace([float("inf"), float("-inf")], pd.NA)
     buf = io.BytesIO()
     out.to_excel(buf, engine="openpyxl", sheet_name="Production (MW)")
@@ -1371,25 +1377,31 @@ with st.expander("💾 Télécharger les données source (production par réacte
         # ── 1 & 2 : toute la base (tous les jours téléchargés) ────────────
         col_dl1, col_dl2 = st.columns(2)
         with col_dl1:
-            st.download_button(
-                "⬇️ Parquet — tous les jours téléchargés",
-                data=build_parquet_prod(df_source_full),
-                file_name="nucleaire_production_FR.parquet",
-                mime="application/octet-stream",
-                use_container_width=True,
-                help="Données source brutes (production MW). Recommandé pour Python/Pandas.",
-            )
-            st.caption("⚡ Rapide · Pour Python")
+            try:
+                st.download_button(
+                    "⬇️ Parquet — tous les jours téléchargés",
+                    data=build_parquet_prod(df_source_full),
+                    file_name="nucleaire_production_FR.parquet",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                    help="Données source brutes (production MW). Recommandé pour Python/Pandas.",
+                )
+                st.caption("⚡ Rapide · Pour Python")
+            except Exception as e:
+                st.warning(f"Parquet indisponible : {e}")
         with col_dl2:
-            st.download_button(
-                "⬇️ Excel — tous les jours téléchargés",
-                data=build_excel_prod(df_source_full),
-                file_name="nucleaire_production_FR.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                help="Toute la base source (tous les jours téléchargés) au format Excel.",
-            )
-            st.caption("📊 Excel · Tous les jours")
+            try:
+                st.download_button(
+                    "⬇️ Excel — tous les jours téléchargés",
+                    data=build_excel_prod(df_source_full),
+                    file_name="nucleaire_production_FR.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    help="Toute la base source (tous les jours téléchargés) au format Excel.",
+                )
+                st.caption("📊 Excel · Tous les jours")
+            except Exception as e:
+                st.warning(f"Excel (base complète) indisponible : {e}")
 
         # ── 3 : période sélectionnée uniquement ──────────────────────────
         st.markdown("---")
@@ -1403,14 +1415,17 @@ with st.expander("💾 Télécharger les données source (production par réacte
                     help="Aucune donnée source pour cette période.",
                 )
             else:
-                st.download_button(
-                    "⬇️ Excel — période sélectionnée",
-                    data=build_excel_prod(df_source_periode),
-                    file_name=f"nucleaire_production_FR_{start_date}_{end_date}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                    help=f"Production source du {start_date} au {end_date}.",
-                )
+                try:
+                    st.download_button(
+                        "⬇️ Excel — période sélectionnée",
+                        data=build_excel_prod(df_source_periode),
+                        file_name=f"nucleaire_production_FR_{start_date}_{end_date}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        help=f"Production source du {start_date} au {end_date}.",
+                    )
+                except Exception as e:
+                    st.warning(f"Excel (période) indisponible : {e}")
         with col_dl4:
             _n_reac = (df_source_periode.shape[1]
                        if df_source_periode is not None and not df_source_periode.empty else 0)

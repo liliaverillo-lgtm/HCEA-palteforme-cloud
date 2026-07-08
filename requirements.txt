@@ -1,8 +1,8 @@
-streamlit
-pandas
-plotly
-entsoe-py
-pyarrow
-s3fs
+streamlit>=1.52
+pandas==2.2.3
+numpy<2.1
+pyarrow==17.0.0
+plotly==5.24.1
+entsoe-py==0.6.16
 boto3
 openpyxl
